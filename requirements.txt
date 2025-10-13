@@ -8,6 +8,7 @@ Pillow
 numpy
 pandas
 
-# AI Model (CPU Version for Deployment)
+# AI Model (CPU Version & Dependencies)
+ultralytics
 torch --index-url https://download.pytorch.org/whl/cpu
 torchvision --index-url https://download.pytorch.org/whl/cpu

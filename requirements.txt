@@ -8,8 +8,6 @@ Pillow
 numpy
 pandas
 
-# AI Model (CPU Version & Dependencies)
-ultralytics
-tqdm  #<-- 이 줄을 추가했습니다.
+# AI Model (CPU Version)
 torch --index-url https://download.pytorch.org/whl/cpu
 torchvision --index-url https://download.pytorch.org/whl/cpu

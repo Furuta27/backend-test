@@ -1,166 +1,176 @@
-# ai-backend-server/app.py
+# app.py — Flask + TorchScript(.ptl) 전용 서버
+# - /            : 서비스 정보
+# - /health      : 헬스체크
+# - /diag        : 실행/모델 진단
+# - /api/detect/image (POST, multipart/form-data, key=image_file|image)
 
-import os
 import io
+import os
+import sys
 import json
-import torch
+import numpy as np
+from typing import List, Dict, Any
+
 from PIL import Image
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+import torch
+import torchvision
+
+# ---------------- Config ----------------
+DEVICE = os.getenv("DEVICE", "cpu")
+MODEL_PATH = os.getenv("MODEL_PATH", "best.torchscript.ptl")   # ✅ TorchScript만!
+LABELS_PATH = os.getenv("LABELS_PATH", "labels.txt")
+IMG_SIZE = int(os.getenv("IMG_SIZE", "640"))
+CONF_THRES = float(os.getenv("CONF_THRES", "0.25"))
+IOU_THRES  = float(os.getenv("IOU_THRES", "0.45"))
+MAX_BODY   = int(os.getenv("MAX_CONTENT_LENGTH", str(20 * 1024 * 1024)))  # 20MB 기본
+
+# ---------------- App -------------------
 app = Flask(__name__)
-CORS(app) # 모든 도메인에서의 요청을 허용 (개발용)
+app.config["MAX_CONTENT_LENGTH"] = MAX_BODY
+CORS(app)  # 필요 시 origins 화이트리스트로 제한 권장
 
-# --- 모델 로딩 ---
-# yolov5s.pt 또는 yolov5s3.torchscript.ptl 파일이 ai-backend-server 폴더에 있어야 합니다.
-# 모델 로딩 방식은 사용하는 모델의 형식에 따라 달라질 수 있습니다.
-# 여기서는 일반적인 YOLOv5 PyTorch 모델 로딩 방식을 사용합니다.
-# 만약 torchscript (.ptl) 파일을 사용한다면, torch.jit.load를 사용해야 합니다.
+# ---------------- Labels ----------------
+if os.path.exists(LABELS_PATH):
+    with open(LABELS_PATH, "r", encoding="utf-8") as f:
+        CLASS_NAMES = [ln.strip() for ln in f if ln.strip()]
+else:
+    CLASS_NAMES = []
 
-MODEL_PATH = 'best.torchscript.ptl' # 또는 'yolov5s3.torchscript.ptl'
-model = None
+# ---------------- Model -----------------
+print(f"[BOOT] python={sys.version}", flush=True)
+print(f"[BOOT] torch={torch.__version__} torchvision={torchvision.__version__}", flush=True)
+print(f"[BOOT] loading TorchScript: {MODEL_PATH}", flush=True)
 
 try:
-    # PyTorch Hub에서 미리 학습된 YOLOv5s 모델 로드
-    # (인터넷 연결 필요, 초기 1회 다운로드)
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-    print("YOLOv5 model loaded from PyTorch Hub.")
+    model = torch.jit.load(MODEL_PATH, map_location=DEVICE)  # ❗ Ultralytics YOLO API 금지
+    model.eval()
+    print(f"[BOOT] model loaded: {type(model).__name__}", flush=True)
 except Exception as e:
-    print(f"Error loading model from PyTorch Hub: {e}")
-    print(f"Attempting to load model from local path: {MODEL_PATH}")
-    try:
-        if MODEL_PATH.endswith('.pt'):
-            # 로컬 .pt 파일 로드
-            model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=False, path=MODEL_PATH)
-            print(f"YOLOv5 model loaded from local .pt file: {MODEL_PATH}")
-        elif MODEL_PATH.endswith('.ptl') or MODEL_PATH.endswith('.torchscript'):
-            # 로컬 torchscript (.ptl) 파일 로드
-            model = torch.jit.load(MODEL_PATH)
-            model.eval() # 추론 모드 설정
-            print(f"YOLOv5 torchscript model loaded from local .ptl file: {MODEL_PATH}")
-        else:
-            print(f"Unsupported model file extension: {MODEL_PATH}. Only .pt or .ptl/.torchscript are supported.")
-    except Exception as e:
-        print(f"Failed to load model from local path {MODEL_PATH}: {e}")
-        model = None # 모델 로드 실패 시 None으로 설정
+    print(f"[BOOT][FATAL] failed to load model: {e}", flush=True)
+    raise
 
-if model is None:
-    print("CRITICAL: AI model could not be loaded. Detection will not work.")
-    
-# 모델을 GPU (CUDA)가 사용 가능하다면 GPU로 옮깁니다.
-if torch.cuda.is_available():
-    model.cuda()
-    print("Model moved to GPU.")
-else:
-    print("CUDA not available. Model running on CPU.")
+# ---------------- Utils -----------------
+def preprocess(pil_img: Image.Image, img_size: int = IMG_SIZE) -> torch.Tensor:
+    """PIL → 1x3xHxW, float32 [0..1]"""
+    img = pil_img.convert("RGB").resize((img_size, img_size))
+    arr = np.asarray(img).astype(np.float32) / 255.0        # HWC
+    arr = np.transpose(arr, (2, 0, 1))                      # CHW
+    x = torch.from_numpy(arr).unsqueeze(0)                  # 1x3xHxW
+    return x
 
-# --- 라벨 파일 로딩 ---
-# YOLOv5의 기본 라벨 (예: 'person', 'car') 파일 경로
-# yolov5s.pt 모델 사용 시 기본적으로 model.names 속성에 포함됩니다.
-# 커스텀 학습 모델이라면 해당 models 폴더의 *.yaml 파일에서 names를 참조하거나
-# 별도의 labels.txt 파일을 만들어 사용합니다.
+def postprocess(pred: Any, conf_thres=CONF_THRES, iou_thres=IOU_THRES) -> List[Dict[str, Any]]:
+    """
+    기대 포맷: (N, 6) with [x1,y1,x2,y2,score,cls]
+    TorchScript가 (pred,) 또는 [pred]로 감싸서 반환할 수 있어 안전 처리.
+    """
+    if isinstance(pred, (list, tuple)):
+        pred = pred[0]
 
-CLASS_LABELS_PATH = 'labels.txt' # 예시: COCO 데이터셋 라벨
-JUNK_LABELS_PATH = 'junk.txt'    # Android 프로젝트에서 가져온 필터링 라벨
+    if not isinstance(pred, torch.Tensor):
+        raise RuntimeError(f"unexpected pred type: {type(pred)}")
 
-ALL_MODEL_CLASS_NAMES = [] # 모델이 감지할 수 있는 모든 클래스 이름
-JUNK_NAMES_TO_FILTER = []  # junk.txt에 정의된 필터링할 클래스 이름들
+    p = pred.detach().cpu()
+    if p.ndim != 2 or p.shape[1] < 6:
+        # 모델 아웃풋 포맷이 다르면 여기에서 매핑하거나 빈 리스트 반환
+        return []
 
-# 모델에서 직접 라벨을 가져오는 것이 가장 정확합니다.
-if model and hasattr(model, 'names'):
-    ALL_MODEL_CLASS_NAMES = model.names
-    print(f"Loaded {len(ALL_MODEL_CLASS_NAMES)} class names directly from model.")
-else:
-    # 모델에서 라벨을 가져올 수 없을 경우 labels.txt에서 로드 시도
-    try:
-        with open(CLASS_LABELS_PATH, 'r', encoding='utf-8') as f:
-            ALL_MODEL_CLASS_NAMES = [line.strip() for line in f if line.strip()]
-        print(f"Loaded {len(ALL_MODEL_CLASS_NAMES)} class labels from {CLASS_LABELS_PATH}")
-    except FileNotFoundError:
-        print(f"Warning: {CLASS_LABELS_PATH} not found. Using placeholder labels for detection output.")
-        ALL_MODEL_CLASS_NAMES = [f'class_{i}' for i in range(80)] # COCO 데이터셋 기준 기본값
+    if p.numel() == 0:
+        return []
 
-# junk.txt 라벨 로딩
-try:
-    with open(JUNK_LABELS_PATH, 'r', encoding='utf-8') as f:
-        JUNK_NAMES_TO_FILTER = [line.strip() for line in f if line.strip()]
-    print(f"Loaded {len(JUNK_NAMES_TO_FILTER)} junk labels from {JUNK_LABELS_PATH}")
-except FileNotFoundError:
-    print(f"Warning: {JUNK_LABELS_PATH} not found. No junk filtering will be applied.")
-    JUNK_NAMES_TO_FILTER = []
+    # confidence 필터
+    mask = p[:, 4] >= conf_thres
+    p = p[mask]
+    if p.numel() == 0:
+        return []
 
-# JUNK_NAMES_TO_FILTER에 해당하는 클래스들의 인덱스를 미리 찾아둡니다.
-# 필터링할 클래스 이름이 ALL_MODEL_CLASS_NAMES에 존재해야 합니다.
-JUNK_CLASS_INDICES_TO_FILTER = [
-    ALL_MODEL_CLASS_NAMES.index(name)
-    for name in JUNK_NAMES_TO_FILTER
-    if name in ALL_MODEL_CLASS_NAMES
-]
-print(f"Junk class indices to filter: {JUNK_CLASS_INDICES_TO_FILTER}")
+    boxes = p[:, :4]
+    scores = p[:, 4]
+    clses  = p[:, 5].to(torch.int64)
 
+    # NMS
+    keep = torchvision.ops.nms(boxes, scores, iou_thres)
+    boxes = boxes[keep].numpy()
+    scores = scores[keep].numpy()
+    clses  = clses[keep].numpy()
 
-# --- REST API 엔드포인트 ---
-
-@app.route('/api/detect/image', methods=['POST'])
-def detect_object_from_image():
-    if model is None:
-        return jsonify({'error': 'AI model not loaded. Please check server logs.'}), 500
-
-    if 'image_file' not in request.files:
-        return jsonify({'error': 'No image_file part in the request'}), 400
-
-    image_file = request.files['image_file']
-    if image_file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-
-    try:
-        # 이미지 로드
-        img = Image.open(io.BytesIO(image_file.read())).convert("RGB")
-
-        # 모델 추론
-        # model(img, size=...)에서 img가 RGB PIL Image 객체여야 합니다.
-        results = model(img, size=640) # size는 모델 입력 크기에 맞춰 조정 (예: YOLOv5 기본 640)
-
-        # 판다스 DataFrame으로 결과 얻기 (xyxy[0]은 첫 번째 이미지의 결과)
-        detections_df = results.pandas().xyxy[0]
-
-        processed_detections = []
-        for _, row in detections_df.iterrows():
-            class_index = int(row['class'])
-            confidence_score = float(row['confidence'])
-
-            # 🟢 junk.txt 기반 필터링 적용 (해당 클래스 인덱스가 JUNK_CLASS_INDICES_TO_FILTER에 없으면 무시)
-            # 즉, junk.txt에 있는 클래스만 통과시킵니다.
-            if JUNK_NAMES_TO_FILTER and class_index not in JUNK_CLASS_INDICES_TO_FILTER:
-                continue 
-            
-            # 신뢰도(score) 임계값 적용 (예시: 25% 미만 신뢰도는 무시)
-            if confidence_score < 0.25: 
-                continue
-
-            processed_detections.append({
-                'classIndex': class_index,
-                'score': confidence_score,
-                'rect': {
-                    'left': float(row['xmin']),
-                    'top': float(row['ymin']),
-                    'right': float(row['xmax']),
-                    'bottom': float(row['ymax'])
-                }
-            })
-
-        # 필터링된 결과와 함께 모델의 모든 클래스 이름을 프론트엔드로 전달합니다.
-        # 프론트엔드는 이 ALL_MODEL_CLASS_NAMES를 사용하여 classIndex를 실제 라벨로 변환합니다.
-        return jsonify({
-            'detections': processed_detections,
-            'class_names': ALL_MODEL_CLASS_NAMES 
+    results: List[Dict[str, Any]] = []
+    for (x1, y1, x2, y2), sc, c in zip(boxes, scores, clses):
+        results.append({
+            "classIndex": int(c),
+            "score": float(sc),
+            "rect": {
+                "left": float(x1), "top": float(y1),
+                "right": float(x2), "bottom": float(y2)
+            }
         })
+    return results
 
+# ---------------- Routes ----------------
+@app.get("/")
+def index():
+    return jsonify({
+        "service": "ok",
+        "endpoints": ["/health", "/diag", "/api/detect/image (POST multipart/form-data)"],
+        "img_size": IMG_SIZE,
+        "conf_thres": CONF_THRES,
+        "iou_thres": IOU_THRES,
+        "max_body_bytes": MAX_BODY,
+    })
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+@app.get("/diag")
+def diag():
+    import importlib.util as ilu
+    return jsonify({
+        "file": __file__,
+        "cwd": os.getcwd(),
+        "python": sys.version,
+        "model_path": MODEL_PATH,
+        "model_type": type(model).__name__,
+        "labels_count": len(CLASS_NAMES),
+        "has_ultralytics": bool(ilu.find_spec("ultralytics")),
+    })
+
+@app.post("/api/detect/image")
+def detect_image():
+    # 클라이언트가 image_file 또는 image 키를 보낼 수 있도록 둘 다 허용
+    f = request.files.get("image_file") or request.files.get("image")
+    if f is None:
+        return jsonify({"error": "No file provided (use 'image_file' or 'image')"}), 400
+
+    try:
+        pil = Image.open(io.BytesIO(f.read())).convert("RGB")
     except Exception as e:
-        print(f"Error during detection: {e}")
-        return jsonify({'error': f'Detection failed: {str(e)}'}), 500
+        return jsonify({"error": f"Invalid image: {e}"}), 400
 
-# --- Flask 서버 실행 ---
-if __name__ == '__main__':
-    # debug=True 설정 시 코드 변경 감지 및 자동 재시작
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    x = preprocess(pil)
+
+    # ✅ TorchScript는 오직 단일 인자만 허용: model(x)
+    try:
+        with torch.no_grad():
+            print("[INFER] calling model(x) only", flush=True)
+            pred = model(x)
+    except TypeError as e:
+        # 이 메시지가 보이면 다른 엔트리/코드가 실행 중일 확률 높음
+        return jsonify({"error": f"TS forward call failed: {e}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"infer failed: {type(e).__name__}: {e}"}), 500
+
+    try:
+        detections = postprocess(pred)
+    except Exception as e:
+        return jsonify({"error": f"postprocess failed: {e}"}), 500
+
+    return jsonify({"detections": detections, "class_names": CLASS_NAMES})
+
+# ---------------- Main ------------------
+if __name__ == "__main__":
+    # 로컬 테스트용 (Render에선 gunicorn 사용)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)

@@ -1,13 +1,11 @@
-# Web Server
+# requirements.txt
 Flask
 flask-cors
 gunicorn
 
-# Image Processing & Data
 Pillow
 numpy
 pandas
 
-# AI Model (CPU Version)
 torch --index-url https://download.pytorch.org/whl/cpu
 torchvision --index-url https://download.pytorch.org/whl/cpu

@@ -5,9 +5,18 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import torch
 import torchvision
-import time
 
+# --- Flask & CORS ---
 app = Flask(__name__)
+try:
+    from flask_cors import CORS
+    CORS(app, resources={r"/*": {"origins": "*"}})
+except Exception:
+    # CORS 미설치시에도 앱은 동작
+    pass
+
+# 업로드 최대 10MB
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 # --- 모델 로드 (서버 시작 시 1회) ---
 MODEL_PATH = os.environ.get("MODEL_PATH", "best.torchscript.ptl")
@@ -16,6 +25,7 @@ DEVICE = "cpu"  # Render 무료 플랜은 보통 CPU
 try:
     model = torch.jit.load(MODEL_PATH, map_location=DEVICE)
     model.eval()
+    print(f"[startup] model loaded from: {MODEL_PATH}")
 except Exception as e:
     print("[startup] model load failed:", e)
     model = None
@@ -32,15 +42,34 @@ def nms(boxes, scores, iou_th=0.45, top_k=50):
     keep = keep[:top_k].tolist()
     return keep
 
+# ---------- 디버그/헬스 ----------
+@app.get("/")
+def index():
+    return jsonify(
+        message="OK: use GET /health and POST /detect",
+        routes=[str(r) for r in app.url_map.iter_rules()],
+    ), 200
+
 @app.get("/health")
 def health():
     return jsonify(status="ok"), 200
 
-@app.post("/detect")
+@app.get("/version")
+def version():
+    return jsonify(
+        torch=str(torch.__version__),
+        torchvision=str(torchvision.__version__),
+        model_loaded=bool(model),
+        model_path=MODEL_PATH,
+    ), 200
+
+# ---------- 탐지 ----------
+# /detect와 /detect/ 모두 허용
+@app.route("/detect", methods=["POST"])
+@app.route("/detect/", methods=["POST"])
 def detect():
     """
-    클라이언트는 multipart/form-data 로 'file' 필드에 이미지를 보냅니다.
-    (필드명: file 권장. 호환 위해 image 도 허용)
+    multipart/form-data 로 'file' (또는 'image') 필드에 이미지를 보냄
     """
     f = request.files.get("file") or request.files.get("image")
     if not f:
@@ -56,28 +85,34 @@ def detect():
     except Exception:
         return jsonify(error="invalid image"), 400
 
-    # 전처리: 640x640 resize + [0,1] normalize + CHW
+    # 전처리: 640x640 resize + CHW float[0,1]
     img_sz = 640
     img_resized = img.resize((img_sz, img_sz))
-    x = torch.from_numpy(
-        (torchvision.transforms.functional.to_tensor(img_resized)).numpy()
-    ).unsqueeze(0)  # [1,3,640,640]
+    x = torchvision.transforms.functional.to_tensor(img_resized).unsqueeze(0)  # [1,3,640,640]
 
     with torch.no_grad():
-        # TorchScript forward는 인자 1개만! (중요)
-        y = model(x)[0]  # 보통 [N, 25200, 85] 형태 (x,y,w,h,obj,cls...)
-        # y: Tensor
+        # TorchScript forward는 인자 1개만!
+        out = model(x)
+        # 모델에 따라 out이 tuple/list일 수 있으니 방어적으로 처리
+        if isinstance(out, (list, tuple)):
+            y = out[0]
+        else:
+            y = out
+        # 기대 형태: [1, 25200, 85] (cx, cy, w, h, obj, cls...)
+        if y.dim() == 3:
+            y = y.squeeze(0)
+        elif y.dim() == 2:
+            pass
+        else:
+            return jsonify(error=f"unexpected model output shape: {list(y.shape)}"), 500
 
-    y = y.squeeze(0).cpu()  # [25200, 85]
-    boxes = []
-    scores = []
-    classes = []
+    y = y.cpu()  # [25200, 85] 가정
+    boxes, scores, classes = [], [], []
 
-    # YOLOv5 형식 가정: cx, cy, w, h 는 0~img_sz 기준
     # obj_conf * class_conf 최대치로 스코어 산출
     for row in y:
         obj = float(row[4])
-        if obj < 0.25:  # confidence threshold
+        if obj < 0.25:
             continue
         cls_confs = row[5:]
         cls_idx = int(torch.argmax(cls_confs))
@@ -100,11 +135,10 @@ def detect():
 
     # 원본 이미지 스케일로 다시 변환
     W, H = img.size
+    sx, sy = W / img_sz, H / img_sz
     detections = []
     for i in keep_idx:
         x1, y1, x2, y2 = boxes[i]
-        # 640 기준 -> 원본 비율 변환
-        sx, sy = W / img_sz, H / img_sz
         detections.append({
             "x": int(x1 * sx),
             "y": int(y1 * sy),
@@ -122,6 +156,15 @@ def detect():
         ],
         detections=detections
     ), 200
+
+# ---------- 에러 핸들러 ----------
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify(
+        error="not found",
+        hint="Use GET /health and POST /detect",
+        routes=[str(r) for r in app.url_map.iter_rules()],
+    ), 404
 
 if __name__ == "__main__":
     print("URL MAP:", app.url_map)

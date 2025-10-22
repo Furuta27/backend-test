@@ -2,9 +2,9 @@
 # - /health : 상태 체크
 # - /detect : 멀티파트 업로드 (file|image)
 # - /detect-json (/detect_json) : JSON(base64) 업로드
-# - /jobs/<id> : 202로 받은 jobId 폴링
-# - Flask 3.x에서 제거된 @before_first_request 를 "호환용 shim"으로 복구
-# - torch/torchvision 미설치 환경에서도 서버는 기동(탐지 결과는 빈 배열)
+# - /jobs/<id> : 202(jobId) 폴링하여 결과 수신
+# - before_first_request 제거된 Flask 3.x를 위한 호환 shim 포함
+# - warmup_and_load() 워밍업 호출 버그 수정: 로컬 m(...)로 invoke 후 model=m 적용
 
 import os
 import io
@@ -32,6 +32,11 @@ try:
     import torch  # type: ignore
     import torchvision  # type: ignore
     TV_AVAILABLE = True
+    try:
+        # 과도한 CPU 스레드 사용 방지(선택)
+        torch.set_num_threads(1)  # type: ignore
+    except Exception:
+        pass
 except Exception:
     torch = None  # type: ignore
     torchvision = None  # type: ignore
@@ -49,7 +54,6 @@ INPUT_SIZE = int(os.environ.get("INPUT_SIZE", "640"))
 
 WORKERS = int(os.environ.get("WORKERS", "2"))
 JOB_TTL_SEC = int(os.environ.get("JOB_TTL_SEC", str(15 * 60)))
-
 MAX_CONTENT_LENGTH_MB = int(os.environ.get("MAX_CONTENT_LENGTH_MB", "12"))
 
 # ───────────────────────────── Flask ─────────────────────────────
@@ -101,7 +105,6 @@ def load_classes() -> None:
             log.info(f"[startup] loaded {len(classes)} classes")
     except Exception as e:
         log.warning(f"[startup] labels load fail: {e}")
-
     if not classes:
         classes = [f"cls_{i}" for i in range(100)]
 
@@ -158,7 +161,7 @@ def preprocess(img: Image.Image):
 
 def postprocess(out, W: int, H: int) -> List[Dict[str, Any]]:
     """YOLOv5(TorchScript) 출력 파싱:
-       각 row: [cx,cy,w,h,obj, cls0, cls1, ...]
+       row: [cx,cy,w,h,obj, cls0, cls1, ...]
     """
     if not TV_AVAILABLE or torch is None:
         return []
@@ -211,17 +214,22 @@ def postprocess(out, W: int, H: int) -> List[Dict[str, Any]]:
     return dets
 
 def warmup_and_load() -> None:
-    """모델/라벨 로딩 + 더미 인퍼런스로 워밍업"""
+    """모델/라벨 로딩 + 더미 인퍼런스로 워밍업 (버그 수정: m(...)로 invoke 후 model=m)"""
     global model, model_err
     try:
         load_classes()
         if not TV_AVAILABLE:
             raise RuntimeError("torch/torchvision not available in this runtime")
 
+        # 1) 모델 로드
         m = torch.jit.load(MODEL_PATH, map_location="cpu")  # type: ignore
         m.eval()  # type: ignore
+
+        # 2) 로컬 모델로 워밍업 (전역 model이 None이므로 yolo_forward() 사용 금지)
         with torch.no_grad():  # type: ignore
-            _ = yolo_forward(torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE))  # type: ignore
+            _ = m(torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE))  # type: ignore
+
+        # 3) 성공 시 전역 반영
         model = m
         model_err = None
         log.info("[startup] model ready")
@@ -275,7 +283,7 @@ def _gc_loop():
         time.sleep(30)
 
 # ───────────────────── 최초 1회 초기화 (Flask 3.x에서도 동작) ─────────────────────
-@app.before_first_request  # ← Flask 3.x에서도 위의 shim을 통해 정상 작동
+@app.before_first_request  # Flask 3.x에서는 위 shim을 통해 실행
 def kickoff():
     threading.Thread(target=warmup_and_load, daemon=True).start()
     start_workers(WORKERS)

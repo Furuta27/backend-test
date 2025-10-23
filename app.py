@@ -68,6 +68,8 @@ def _postprocess_dummy(w: int, h: int) -> Dict[str, Any]:
 def load_model_bg():
     """백그라운드에서 모델 로드."""
     global model, model_err, ready
+    # 시작 시 에러 클리어
+    model_err = None
     try:
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -79,46 +81,57 @@ def load_model_bg():
 
         _read_labels()
 
-        # 1) ultralytics YOLO
+        # ── 1) ultralytics YOLO (선택: 있으면 사용, 없으면 조용히 패스)
         mdl_path = None
         for p in ["best.pt", "yolov5s.pt", "weights/best.pt"]:
             if os.path.exists(p):
-                mdl_path = p; break
+                mdl_path = p
+                break
+
         if mdl_path:
             try:
-                from ultralytics import YOLO  # type: ignore
+                # importlib로 옵션 임포트 → 모듈 없으면 ImportError만 경고 로그
+                import importlib
+                yolo_mod = importlib.import_module("ultralytics")
+                YOLO = getattr(yolo_mod, "YOLO")
                 m = YOLO(mdl_path)
                 model = ("ultralytics", m)
                 ready = True
+                model_err = None
                 app.logger.info(f"[startup] ultralytics model loaded: {mdl_path}")
                 return
             except Exception as e:
-                app.logger.exception("[startup] ultralytics load failed")
-                model_err = f"ultralytics load failed: {e}"
+                # ❗ 여긴 실패해도 폴백하므로 error 고정 금지 (warning 정도만)
+                app.logger.warning(f"[startup] ultralytics unavailable: {e}")
 
-        # 2) torchscript(.ptl)
+        # ── 2) torchscript(.ptl) 폴백 (Render 512MB 친화적)
         ts_path = None
         for p in ["best.torchscript.ptl", "yolov5s3.torchscript.ptl"]:
             if os.path.exists(p):
-                ts_path = p; break
+                ts_path = p
+                break
         if ts_path:
             import torch
             m = torch.jit.load(ts_path, map_location="cpu")
             m.eval()
             model = ("torchscript", m)
             ready = True
+            model_err = None
             app.logger.info(f"[startup] torchscript model loaded: {ts_path}")
             return
 
-        # 3) fallback dummy
+        # ── 3) 최종 폴백: 더미
         model = ("dummy", None)
         ready = True
+        model_err = None
         app.logger.warning("[startup] no model found, fallback to dummy inference")
 
     except Exception as e:
+        # 진짜로 모든 경로가 실패했을 때만 에러로 표시
         model_err = str(e)
         ready = False
         app.logger.exception("[startup] model load failed")
+
 
 def run_inference(img_bytes: bytes) -> Dict[str, Any]:
     t0 = time.time()

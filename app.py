@@ -1,9 +1,9 @@
-# app.py — Low-mem Flask backend (Render 512MB 대응) + Sync 모드
+# app.py — Low-mem Flask backend (Render 512MB 대응) + Sync 모드 + TorchScript 출력 정규화
 # - /health : 상태 체크 (ready/warming/error)
 # - /detect : 멀티파트 업로드 (file|image)  [sync=1 지원 → 즉시 200]
 # - /detect-json (/detect_json) : JSON(base64) 업로드 [sync=1 지원]
 # - /jobs/<id> : 비동기 모드 폴링용 (202/200)
-# - before_first_request (Flask 3.x) 호환 shim 포함
+# - Flask 3.x 호환 shim 포함 (before_first_request)
 # - torchvision 불필요(NumPy NMS + PIL 전처리), 큐는 "파일 경로"만 저장해 메모리 절약
 
 import os, io, time, uuid, base64, queue, threading, logging, tempfile, gc
@@ -124,35 +124,98 @@ def nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_th=0.45, top_k=50):
         order = order[inds+1]
     return keep
 
-def postprocess(out, W:int, H:int):
-    if torch is None or out is None: return []
-    t = out.squeeze(0).cpu().numpy() if hasattr(out, "cpu") else np.array(out)
-    boxes, scores, cls_idx = [], [], []
+def _normalize_to_tensor(out):
+    """TorchScript 모델 출력이 list/tuple/dict여도 단일 텐서로 정규화."""
+    # 1) list/tuple이면 첫 요소 사용 (YOLOv5 TS가 [tensor] 반환하는 케이스)
+    if isinstance(out, (list, tuple)) and len(out) > 0:
+        out = out[0]
+    # 2) dict인 경우 값 중 텐서 같은 것을 사용
+    if isinstance(out, dict):
+        for v in out.values():
+            if hasattr(v, "dim"):
+                out = v
+                break
+    return out
+
+def postprocess(out, W: int, H: int) -> List[Dict[str, Any]]:
+    """YOLOv5(TorchScript) 출력 파싱:
+       row: [cx,cy,w,h,obj, cls0, cls1, ...]
+    """
+    if torch is None or out is None:
+        return []
+
+    # ✅ 출력 정규화
+    out = _normalize_to_tensor(out)
+
+    # ✅ 넘파이로 안전 변환
+    if hasattr(out, "detach"):
+        out = out.detach()
+    if hasattr(out, "cpu"):
+        out = out.cpu()
+    try:
+        t = out.numpy()
+    except Exception:
+        t = np.array(out)
+
+    # [1, N, C] → [N, C], 혹은 [N, C] 유지
+    if t.ndim == 3 and t.shape[0] == 1:
+        t = t[0]
+    elif t.ndim == 1:
+        t = t[0:1]
+
+    # 방어: 열 개수 점검 (최소 6열: cx,cy,w,h,obj,cls0)
+    if t.ndim != 2 or t.shape[1] < 6:
+        return []
+
+    boxes: List[List[float]] = []
+    scores: List[float] = []
+    cls_idx: List[int] = []
+
     for row in t:
         obj = float(row[4])
-        if obj < 1e-6: continue
+        if obj < 1e-6:
+            continue
         cls_confs = row[5:]
+        if np.size(cls_confs) == 0:
+            continue
         ci = int(np.argmax(cls_confs))
-        sc = obj * float(cls_confs[ci])
-        if sc < CONF_TH: continue
+        cc = float(cls_confs[ci])
+        sc = obj * cc
+        if sc < CONF_TH:
+            continue
+
         cx, cy, w, h = [float(v) for v in row[:4]]
-        x1 = max(0.0, cx - w/2); y1 = max(0.0, cy - h/2)
-        x2 = min(float(INPUT_SIZE), cx + w/2); y2 = min(float(INPUT_SIZE), cy + h/2)
-        boxes.append([x1,y1,x2,y2]); scores.append(sc); cls_idx.append(ci)
-    if not boxes: return []
-    b = np.array(boxes, dtype=np.float32); s = np.array(scores, dtype=np.float32)
+        x1 = max(0.0, cx - w / 2)
+        y1 = max(0.0, cy - h / 2)
+        x2 = min(float(INPUT_SIZE), cx + w / 2)
+        y2 = min(float(INPUT_SIZE), cy + h / 2)
+        boxes.append([x1, y1, x2, y2])
+        scores.append(sc)
+        cls_idx.append(ci)
+
+    if not boxes:
+        return []
+
+    b = np.array(boxes, dtype=np.float32)
+    s = np.array(scores, dtype=np.float32)
+
     keep = nms_numpy(b, s, IOU_TH, TOP_K)
-    sx, sy = W/INPUT_SIZE, H/INPUT_SIZE
-    dets = []
+    sx, sy = W / INPUT_SIZE, H / INPUT_SIZE
+
+    dets: List[Dict[str, Any]] = []
     for i in keep:
-        x1,y1,x2,y2 = b[i]
-        dets.append({
-            "x": int(x1*sx), "y": int(y1*sy),
-            "w": int((x2-x1)*sx), "h": int((y2-y1)*sy),
-            "score": round(float(s[i]),4),
-            "classIndex": int(cls_idx[i]),
-            "className": classes[cls_idx[i]] if 0 <= cls_idx[i] < len(classes) else str(cls_idx[i]),
-        })
+        x1, y1, x2, y2 = b[i]
+        dets.append(
+            {
+                "x": int(x1 * sx),
+                "y": int(y1 * sy),
+                "w": int((x2 - x1) * sx),
+                "h": int((y2 - y1) * sy),
+                "score": round(float(s[i]), 4),
+                "classIndex": int(cls_idx[i]),
+                "className": classes[cls_idx[i]] if 0 <= cls_idx[i] < len(classes) else str(cls_idx[i]),
+            }
+        )
     return dets
 
 def run_detect_bytes(data: bytes, filename: str):
@@ -309,7 +372,7 @@ def detect_json():
     suffix = os.path.splitext(filename)[1] or ".jpg"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(data); tmp.flush(); tmp.close()
-    job_id = str(uuid.uuid4())
+    job_id = str(uuid.uuiduuid4()) if hasattr(uuid, "uuiduuid4") else str(uuid.uuid4())
     jobs[job_id] = {"status":"queued","t0":time.time()}
     in_queue.put((job_id, tmp.name, filename))
     return jsonify({"jobId": job_id}), 202

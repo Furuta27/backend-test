@@ -5,17 +5,17 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ── 글로벌 상태 ───────────────────────────────────────────────────────────────
-model = None               # ("ultralytics"|“torchscript”|“dummy”, handle)
+model: Optional[tuple] = None       # ("torchscript" | "dummy", handle)
 model_err: Optional[str] = None
 ready = False
 
 LABELS = []
-INPUT_SIZE = int(os.getenv("INPUT_SIZE", "640"))
-ALLOW_SYNC = True
+INPUT_SIZE = int(os.getenv("INPUT_SIZE", "640"))   # 필요하면 416/384로 낮추면 메모리/502에 유리
+ALLOW_SYNC = False                                  # ★ 항상 비동기(202 + /jobs 폴링)
 
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_q: "queue.Queue[Tuple[str, bytes, str]]" = queue.Queue()
-_infer_lock = threading.Lock()         # 동시 추론 1개로 제한(메모리 절약)
+_infer_lock = threading.Lock()         # 동시 추론 1개 제한(메모리 절약)
 _started_once = False                  # 시작 루틴 1회만 실행
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────
@@ -50,6 +50,7 @@ def _resize_keep_ar(img, target: int):
     return img.resize((new_w, new_h), Image.BILINEAR), new_w, new_h
 
 def _postprocess_dummy(w: int, h: int) -> Dict[str, Any]:
+    # 간단한 더미 박스(디버그용)
     cx, cy = w // 3, h // 3
     bw, bh = max(40, w // 4), max(40, h // 4)
     return {
@@ -66,7 +67,7 @@ def _postprocess_dummy(w: int, h: int) -> Dict[str, Any]:
 
 # ── 모델 로드 / 추론 ─────────────────────────────────────────────────────────
 def load_model_bg():
-    """오직 yolov5s3.torchscript.ptl 만 로드 (ultralytics .pt 사용 안 함)."""
+    """오직 yolov5s3.torchscript.ptl (또는 MODEL_TS_PATH)만 로드. .pt/ultralytics는 사용하지 않음."""
     global model, model_err, ready
 
     model = None
@@ -74,33 +75,37 @@ def load_model_bg():
     ready = False
 
     try:
-        # 스레드/라벨 설정
+        # 스레드/옵션 최소화(메모리 절약)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         try:
             import torch
             torch.set_num_threads(1)
-            torch.set_grad_enabled(False)
+            torch.set_num_interop_threads(1)
+            torch.set_grad_enabled(False)  # type: ignore[attr-defined]
+            # mkldnn 끄면 메모리 폭주 케이스 완화되는 환경이 있음
+            try:
+                import torch.backends.mkldnn as mkldnn  # type: ignore
+                mkldnn.enabled = False  # type: ignore[attr-defined]
+            except Exception:
+                pass
         except Exception:
             pass
 
         _read_labels()
 
-        # ── TorchScript 모델 경로 고정 ────────────────────────────────────────
-        # 환경변수로 바꾸고 싶으면 MODEL_TS_PATH 사용, 기본은 정확히 요구한 파일명
+        # TorchScript 경로만 허용
         ts_path = os.getenv("MODEL_TS_PATH", "yolov5s3.torchscript.ptl")
         if not os.path.exists(ts_path):
-            # 요청대로 .pt/ultralytics 폴백 없이 바로 오류 상태로 둔다
             model_err = f"torchscript model not found: {ts_path}"
             ready = False
             app.logger.error(f"[startup] {model_err}")
             return
 
-        # ── TorchScript 로드 (CPU) ───────────────────────────────────────────
+        # TorchScript 로드 (CPU)
         import torch
         m = torch.jit.load(ts_path, map_location="cpu")
         m.eval()
-        # optimize_for_inference는 경우에 따라 script 모듈에서만 동작하므로 보수적으로 생략
         model = ("torchscript", m)
         ready = True
         model_err = None
@@ -111,7 +116,6 @@ def load_model_bg():
         ready = False
         model_err = str(e)
         app.logger.exception("[startup] torchscript load failed")
-
 
 def run_inference(img_bytes: bytes) -> Dict[str, Any]:
     t0 = time.time()
@@ -126,31 +130,6 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
         res["time_ms"] = int((time.time() - t0) * 1000)
         return res
 
-    if kind == "ultralytics":
-        from ultralytics.utils import ops  # type: ignore
-        m = model[1]
-        preds = m.predict(pil_resized, imgsz=max(rw, rh), verbose=False)[0]
-        dets = []
-        if preds.boxes is not None and len(preds.boxes) > 0:
-            for b in preds.boxes:
-                xyxy = b.xyxy[0].tolist()
-                conf = float(b.conf[0].item())
-                cls = int(b.cls[0].item())
-                x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
-                w = max(0, x2 - x1); h = max(0, y2 - y1)
-                dets.append({
-                    "classIndex": cls,
-                    "className": (LABELS[cls] if 0 <= cls < len(LABELS) else None),
-                    "x": max(0, x1), "y": max(0, y1),
-                    "w": w, "h": h, "score": conf
-                })
-        return {
-            "class_names": LABELS or preds.names or [],
-            "detections": dets,
-            "time_ms": int((time.time() - t0) * 1000),
-            "__serverImageW": rw, "__serverImageH": rh,
-        }
-
     if kind == "torchscript":
         import torch, numpy as np
         m = model[1]
@@ -158,16 +137,27 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
         inp = torch.from_numpy(np_img).permute(2,0,1).unsqueeze(0).float() / 255.0
         with torch.no_grad():
             out = m(inp)
-        if isinstance(out, (list, tuple)): out = out[0]
-        if hasattr(out, "numpy"): out = out.numpy()
-        elif isinstance(out, torch.Tensor): out = out.cpu().numpy()
+
+        # 다양한 TorchScript export 포맷 대응
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        if isinstance(out, torch.Tensor):
+            out = out.cpu().numpy()
+        # out이 (N,6) 또는 (1,N,6) 등일 수 있음 → (N,6)로 정규화
+        try:
+            arr = out
+            if hasattr(arr, "shape") and len(arr.shape) == 3:
+                arr = arr[0]
+        except Exception:
+            arr = out
 
         dets = []
         try:
-            for row in out:
-                if len(row) < 6: continue
+            for row in arr:
+                if len(row) < 6:
+                    continue
                 x1,y1,x2,y2,conf,cls = row[:6]
-                x1,y1,x2,y2 = int(round(x1)),int(round(y1)),int(round(x2)),int(round(y2))
+                x1,y1,x2,y2 = int(round(float(x1))), int(round(float(y1))), int(round(float(x2))), int(round(float(y2)))
                 w = max(0, x2-x1); h = max(0, y2-y1)
                 dets.append({
                     "classIndex": int(cls),
@@ -176,7 +166,9 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
                     "w": w, "h": h, "score": float(conf)
                 })
         except Exception:
+            # 모델 출력 포맷이 다르면 더미로 폴백(서비스 지속성 우선)
             dets = _postprocess_dummy(rw, rh)["detections"]
+
         return {
             "class_names": LABELS,
             "detections": dets,
@@ -184,6 +176,7 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
             "__serverImageW": rw, "__serverImageH": rh,
         }
 
+    # 이외는 더미
     res = _postprocess_dummy(rw, rh)
     res["__serverImageW"] = rw; res["__serverImageH"] = rh
     res["time_ms"] = int((time.time() - t0) * 1000)
@@ -222,7 +215,6 @@ def _startup_once():
 @app.before_request
 def _ensure_started():
     _startup_once()
-    # 요청 시작 시간(선택)
     request.start_ts = time.time()
 
 # ── 헬스/루트 ────────────────────────────────────────────────────────────────
@@ -253,21 +245,20 @@ def _read_image_from_request() -> Tuple[Optional[bytes], Optional[str]]:
         pass
     return None, None
 
-# ── 감지 API ─────────────────────────────────────────────────────────────────
+# ── 감지 API (항상 비동기 큐) ────────────────────────────────────────────────
 @app.post("/detect")
 def detect():
     if not ready or model is None:
-        return jsonify(error="loading"), 503
+        # 모델 미준비 / 에러 상태
+        code = 500 if model_err else 503
+        return jsonify(error="loading" if code == 503 else model_err), code
 
     img_bytes, kind = _read_image_from_request()
     if not img_bytes:
         return jsonify(error="no file"), 400
 
-    sync = ALLOW_SYNC and (
-        request.args.get("sync") == "1" or request.headers.get("X-Detect-Sync") == "1"
-    )
-
-    if sync:
+    # 동기 처리 금지(ALLOW_SYNC=False). 필요시만 True로 변경.
+    if ALLOW_SYNC and (request.args.get("sync") == "1" or request.headers.get("X-Detect-Sync") == "1"):
         try:
             with _infer_lock:
                 out = run_inference(img_bytes)
@@ -278,6 +269,7 @@ def detect():
         finally:
             del img_bytes; gc.collect()
 
+    # 비동기 잡 등록
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "queued"}
     _job_q.put((job_id, img_bytes, kind or "multipart"))
@@ -285,6 +277,7 @@ def detect():
 
 @app.post("/detect-json")
 def detect_json():
+    # JSON(base64)도 동일한 큐 처리
     return detect()
 
 @app.get("/jobs/<job_id>")

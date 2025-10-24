@@ -66,71 +66,51 @@ def _postprocess_dummy(w: int, h: int) -> Dict[str, Any]:
 
 # ── 모델 로드 / 추론 ─────────────────────────────────────────────────────────
 def load_model_bg():
-    """백그라운드에서 모델 로드."""
+    """오직 yolov5s3.torchscript.ptl 만 로드 (ultralytics .pt 사용 안 함)."""
     global model, model_err, ready
-    # 시작 시 에러 클리어
+
+    model = None
     model_err = None
+    ready = False
+
     try:
+        # 스레드/라벨 설정
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         try:
             import torch
             torch.set_num_threads(1)
+            torch.set_grad_enabled(False)
         except Exception:
             pass
 
         _read_labels()
 
-        # ── 1) ultralytics YOLO (선택: 있으면 사용, 없으면 조용히 패스)
-        mdl_path = None
-        for p in ["best.pt", "yolov5s.pt", "weights/best.pt"]:
-            if os.path.exists(p):
-                mdl_path = p
-                break
-
-        if mdl_path:
-            try:
-                # importlib로 옵션 임포트 → 모듈 없으면 ImportError만 경고 로그
-                import importlib
-                yolo_mod = importlib.import_module("ultralytics")
-                YOLO = getattr(yolo_mod, "YOLO")
-                m = YOLO(mdl_path)
-                model = ("ultralytics", m)
-                ready = True
-                model_err = None
-                app.logger.info(f"[startup] ultralytics model loaded: {mdl_path}")
-                return
-            except Exception as e:
-                # ❗ 여긴 실패해도 폴백하므로 error 고정 금지 (warning 정도만)
-                app.logger.warning(f"[startup] ultralytics unavailable: {e}")
-
-        # ── 2) torchscript(.ptl) 폴백 (Render 512MB 친화적)
-        ts_path = None
-        for p in ["best.torchscript.ptl", "yolov5s3.torchscript.ptl"]:
-            if os.path.exists(p):
-                ts_path = p
-                break
-        if ts_path:
-            import torch
-            m = torch.jit.load(ts_path, map_location="cpu")
-            m.eval()
-            model = ("torchscript", m)
-            ready = True
-            model_err = None
-            app.logger.info(f"[startup] torchscript model loaded: {ts_path}")
+        # ── TorchScript 모델 경로 고정 ────────────────────────────────────────
+        # 환경변수로 바꾸고 싶으면 MODEL_TS_PATH 사용, 기본은 정확히 요구한 파일명
+        ts_path = os.getenv("MODEL_TS_PATH", "yolov5s3.torchscript.ptl")
+        if not os.path.exists(ts_path):
+            # 요청대로 .pt/ultralytics 폴백 없이 바로 오류 상태로 둔다
+            model_err = f"torchscript model not found: {ts_path}"
+            ready = False
+            app.logger.error(f"[startup] {model_err}")
             return
 
-        # ── 3) 최종 폴백: 더미
-        model = ("dummy", None)
+        # ── TorchScript 로드 (CPU) ───────────────────────────────────────────
+        import torch
+        m = torch.jit.load(ts_path, map_location="cpu")
+        m.eval()
+        # optimize_for_inference는 경우에 따라 script 모듈에서만 동작하므로 보수적으로 생략
+        model = ("torchscript", m)
         ready = True
         model_err = None
-        app.logger.warning("[startup] no model found, fallback to dummy inference")
+        app.logger.info(f"[startup] torchscript model loaded: {ts_path}")
 
     except Exception as e:
-        # 진짜로 모든 경로가 실패했을 때만 에러로 표시
-        model_err = str(e)
+        model = None
         ready = False
-        app.logger.exception("[startup] model load failed")
+        model_err = str(e)
+        app.logger.exception("[startup] torchscript load failed")
 
 
 def run_inference(img_bytes: bytes) -> Dict[str, Any]:

@@ -1,4 +1,4 @@
-import os, io, time, json, uuid, threading, queue, gc
+import os, io, time, uuid, threading, queue, gc
 from typing import Tuple, Dict, Any, Optional
 from flask import Flask, request, jsonify
 
@@ -10,7 +10,7 @@ model_err: Optional[str] = None
 ready = False
 
 LABELS = []
-INPUT_SIZE = int(os.getenv("INPUT_SIZE", "640"))   # 필요하면 416/384로 낮추면 메모리/502에 유리
+INPUT_SIZE = int(os.getenv("INPUT_SIZE", "640"))   # 416/384로 낮추면 메모리/502 완화
 ALLOW_SYNC = False                                  # ★ 항상 비동기(202 + /jobs 폴링)
 
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -50,7 +50,7 @@ def _resize_keep_ar(img, target: int):
     return img.resize((new_w, new_h), Image.BILINEAR), new_w, new_h
 
 def _postprocess_dummy(w: int, h: int) -> Dict[str, Any]:
-    # 간단한 더미 박스(디버그용)
+    # 디버그용 더미 박스 1개 (이미 Top-1 형태)
     cx, cy = w // 3, h // 3
     bw, bh = max(40, w // 4), max(40, h // 4)
     return {
@@ -83,7 +83,6 @@ def load_model_bg():
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
             torch.set_grad_enabled(False)  # type: ignore[attr-defined]
-            # mkldnn 끄면 메모리 폭주 케이스 완화되는 환경이 있음
             try:
                 import torch.backends.mkldnn as mkldnn  # type: ignore
                 mkldnn.enabled = False  # type: ignore[attr-defined]
@@ -131,23 +130,22 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
         return res
 
     if kind == "torchscript":
-        import torch, numpy as np
+        import torch
         m = model[1]
         np_img = _to_numpy(pil_resized)           # HWC RGB
         inp = torch.from_numpy(np_img).permute(2,0,1).unsqueeze(0).float() / 255.0
         with torch.no_grad():
             out = m(inp)
 
-        # 다양한 TorchScript export 포맷 대응
+        # 다양한 TorchScript export 포맷 대응 → numpy/리스트로 정규화
         if isinstance(out, (list, tuple)):
             out = out[0]
         if isinstance(out, torch.Tensor):
             out = out.cpu().numpy()
-        # out이 (N,6) 또는 (1,N,6) 등일 수 있음 → (N,6)로 정규화
         try:
             arr = out
             if hasattr(arr, "shape") and len(arr.shape) == 3:
-                arr = arr[0]
+                arr = arr[0]              # (1,N,6) → (N,6)
         except Exception:
             arr = out
 
@@ -166,8 +164,11 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
                     "w": w, "h": h, "score": float(conf)
                 })
         except Exception:
-            # 모델 출력 포맷이 다르면 더미로 폴백(서비스 지속성 우선)
             dets = _postprocess_dummy(rw, rh)["detections"]
+
+        # ★ Top-1만 남기기
+        dets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
+        dets = dets[:1]
 
         return {
             "class_names": LABELS,
@@ -249,7 +250,6 @@ def _read_image_from_request() -> Tuple[Optional[bytes], Optional[str]]:
 @app.post("/detect")
 def detect():
     if not ready or model is None:
-        # 모델 미준비 / 에러 상태
         code = 500 if model_err else 503
         return jsonify(error="loading" if code == 503 else model_err), code
 
@@ -257,19 +257,7 @@ def detect():
     if not img_bytes:
         return jsonify(error="no file"), 400
 
-    # 동기 처리 금지(ALLOW_SYNC=False). 필요시만 True로 변경.
-    if ALLOW_SYNC and (request.args.get("sync") == "1" or request.headers.get("X-Detect-Sync") == "1"):
-        try:
-            with _infer_lock:
-                out = run_inference(img_bytes)
-            return jsonify(out), 200
-        except Exception as e:
-            app.logger.exception("[detect] sync failed")
-            return jsonify(error=str(e)), 500
-        finally:
-            del img_bytes; gc.collect()
-
-    # 비동기 잡 등록
+    # 비동기 잡 등록 (ALLOW_SYNC=False 유지)
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "queued"}
     _job_q.put((job_id, img_bytes, kind or "multipart"))
@@ -277,7 +265,6 @@ def detect():
 
 @app.post("/detect-json")
 def detect_json():
-    # JSON(base64)도 동일한 큐 처리
     return detect()
 
 @app.get("/jobs/<job_id>")

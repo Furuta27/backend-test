@@ -1,0 +1,11 @@
+# 변경 확인
+git status
+
+# app.py만 스테이징
+git add app.py
+
+# 커밋 (메시지는 예시)
+git commit -m "fix(api): update /detect handler for TorchScript forward()"
+
+# 현재 브랜치로 푸시 (main이면 main으로)
+git push

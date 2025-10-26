@@ -94,7 +94,7 @@ def load_model_bg():
         _read_labels()
 
         # TorchScript 경로만 허용
-        ts_path = os.getenv("MODEL_TS_PATH", "yolov5s3.torchscript.ptl")
+        ts_path = os.getenv("MODEL_TS_PATH", "yolov5s4.torchscript.ptl")
         if not os.path.exists(ts_path):
             model_err = f"torchscript model not found: {ts_path}"
             ready = False

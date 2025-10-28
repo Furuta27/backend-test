@@ -1,10 +1,14 @@
-# requirements.txt
-flask
-pillow
+# Flask & server
+flask>=3.0,<4
+gunicorn>=22,<24
+
+# Imaging / array
+pillow>=10,<12
+numpy>=1.26,<3
+
+# TorchScript (CPU)
 torch
-requests
-xmltodict
-numpy
-gunicorn>=22,<24  
-torch --index-url https://download.pytorch.org/whl/cpu
-torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# (선택) 기타
+# requests
+# xmltodict

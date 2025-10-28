@@ -1,30 +1,42 @@
 import os, io, gc, json, uuid, time, threading, queue
 from typing import Dict, Any, Optional, Tuple, List
+
 from flask import Flask, request, jsonify
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask
+# ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# ====== 설정 ======
-TS_MODEL_PATH = os.getenv("TS_MODEL_PATH", "yolov5s4.torchscript.ptl")  # ← 이 파일이 반드시 존재해야 함
-INPUT_SIZE   = int(os.getenv("INPUT_SIZE", "640"))
-CONF_THRES   = float(os.getenv("CONF_THRES", "0.25"))
-ALLOW_SYNC   = True
+# ─────────────────────────────────────────────────────────────────────────────
+# Config (env로 조정 가능)
+# ─────────────────────────────────────────────────────────────────────────────
+TS_MODEL_PATH = os.getenv("TS_MODEL_PATH", "yolov5s4.torchscript.ptl")  # ← 이 파일만 사용
+INPUT_SIZE    = int(os.getenv("INPUT_SIZE", "640"))                      # YOLO 입력 정사각 크기
+CONF_THRES    = float(os.getenv("CONF_THRES", "0.25"))                   # confidence 임계값
+ALLOW_SYNC    = True                                                     # ?sync=1 허용 여부
 
-# ====== 상태 ======
+# ─────────────────────────────────────────────────────────────────────────────
+# Global state
+# ─────────────────────────────────────────────────────────────────────────────
 model_kind: str = "none"   # "torchscript" | "none"
-model = None               # torchscript module
+model = None               # torchscript jit module
 model_err: Optional[str] = None
 ready: bool = False
 
 LABELS: List[str] = []
 
+# 202 비동기 작업 큐
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_q: "queue.Queue[Tuple[str, bytes, str]]" = queue.Queue()
-_infer_lock = threading.Lock()
+_infer_lock = threading.Lock()  # 추론 동시 1개로 제한(메모리 안정)
 _started_once = False
 
-# ====== 유틸 ======
+# ─────────────────────────────────────────────────────────────────────────────
+# Utils
+# ─────────────────────────────────────────────────────────────────────────────
 def _read_labels():
+    """labels.txt 파일을 읽어 클래스 이름을 구성"""
     global LABELS
     p = os.path.join(os.getcwd(), "junk.txt")
     if os.path.exists(p):
@@ -42,6 +54,10 @@ def _to_numpy(img):
     return np.array(img)
 
 def _letterbox_pil(im, new_size: int):
+    """
+    PIL.Image -> (letterboxed PIL.Image, scale, pad_x, pad_y, orig_w, orig_h)
+    여백(114,114,114)으로 new_size x new_size 정사각에 맞춤(비율 유지)
+    """
     from PIL import Image
     ow, oh = im.size
     if ow <= 0 or oh <= 0:
@@ -56,6 +72,7 @@ def _letterbox_pil(im, new_size: int):
     return canvas, scale, pad_x, pad_y, ow, oh
 
 def _unwrap_to_numpy(x):
+    """torch.Tensor | list | tuple | ndarray → ndarray 로 통일"""
     import numpy as np
     try:
         import torch
@@ -75,7 +92,7 @@ def _unwrap_to_numpy(x):
 
 def _parse_yolo_output(arr, conf_thres: float) -> List[List[float]]:
     """
-    기대 형식: (N,6) or (1,N,6): [x1,y1,x2,y2,conf,cls]
+    기대 형식: (N,6) 또는 (1,N,6) with [x1,y1,x2,y2,conf,cls]
     """
     import numpy as np
     if arr is None:
@@ -84,9 +101,9 @@ def _parse_yolo_output(arr, conf_thres: float) -> List[List[float]]:
     if isinstance(a, (list, tuple)):
         a = np.array(a)
     if a.ndim == 3 and a.shape[0] == 1:
-        a = a[0]
+        a = a[0]  # (1,N,6) → (N,6)
     if not (a.ndim == 2 and a.shape[1] >= 6):
-        # object 배열 방어
+        # object 배열 방어적으로 평탄화
         flat = []
         try:
             for row in a:
@@ -103,15 +120,18 @@ def _parse_yolo_output(arr, conf_thres: float) -> List[List[float]]:
             out.append([x1,y1,x2,y2,conf,cls])
     return out
 
-# ====== 모델 로드 / 추론 ======
+# ─────────────────────────────────────────────────────────────────────────────
+# Model loading / inference
+# ─────────────────────────────────────────────────────────────────────────────
 def load_model_sync():
-    """동기 로딩: import 시점에 바로 호출되어 ready 상태로 올림."""
+    """동기 로딩: import 시점에 바로 모델을 올려 ready 상태로 만든다."""
     global model, model_kind, model_err, ready
     model = None
     model_kind = "none"
     model_err = None
     ready = False
     try:
+        # 스레드 수 제한(메모리/CPU 안정)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         try:
@@ -130,6 +150,7 @@ def load_model_sync():
         import torch
         m = torch.jit.load(TS_MODEL_PATH, map_location="cpu")
         m.eval()
+        # 조기 실패를 위해 더미 입력으로 1회 실행
         with torch.no_grad():
             _ = m(torch.zeros(1,3,INPUT_SIZE,INPUT_SIZE))
         model = m
@@ -144,14 +165,18 @@ def load_model_sync():
         app.logger.exception("[startup] model load failed")
 
 def run_inference(img_bytes: bytes) -> Dict[str, Any]:
+    """단일 이미지 바이트에 대한 추론. 결과 박스는 원본 이미지 좌표로 반환."""
     if not ready or model is None or model_kind != "torchscript":
         raise RuntimeError("model not ready")
+
     import torch
     t0 = time.time()
+
     pil = _pil_open(img_bytes)
     canvas, scale, pad_x, pad_y, ow, oh = _letterbox_pil(pil, INPUT_SIZE)
-    np_img = _to_numpy(canvas)
+    np_img = _to_numpy(canvas)  # HWC RGB
     inp = torch.from_numpy(np_img).permute(2,0,1).unsqueeze(0).float() / 255.0
+
     with torch.no_grad():
         out = model(inp)
     arr = _unwrap_to_numpy(out)
@@ -159,6 +184,7 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
 
     dets: List[Dict[str, Any]] = []
     for x1,y1,x2,y2,conf,cls in raw:
+        # letterbox → 원본 좌표계로 역변환
         ox1 = max(0.0, min(ow, (x1 - pad_x)/scale))
         oy1 = max(0.0, min(oh, (y1 - pad_y)/scale))
         ox2 = max(0.0, min(ow, (x2 - pad_x)/scale))
@@ -182,7 +208,9 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
         "__input_size": INPUT_SIZE, "__model": model_kind,
     }
 
-# ====== 워커(비동기) ======
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker (async 202)
+# ─────────────────────────────────────────────────────────────────────────────
 def _start_worker_once():
     def _worker():
         app.logger.info("[worker] started")
@@ -207,16 +235,45 @@ def _startup_once(sync: bool = True):
     if _started_once: return
     _started_once = True
     if sync:
-        load_model_sync()        # ★ import 시점에 동기 로딩
+        load_model_sync()        # ★ import 시 동기 로딩
     else:
         threading.Thread(target=load_model_sync, daemon=True).start()
     _start_worker_once()
     app.logger.info("[startup] background threads started")
 
-# ★★★ import 시점에 바로 실행 → gunicorn이 import할 때 모델까지 올림
+# ★ import 시점에 바로 실행 → gunicorn import 중에 모델 로딩 완료
 _startup_once(sync=True)
 
-# ====== 라우트 ======
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _read_image_from_request() -> Tuple[Optional[bytes], Optional[str]]:
+    """multipart(file|image) 또는 JSON({data: base64}) 지원"""
+    file = request.files.get("file") or request.files.get("image")
+    if file:
+        return file.read(), "multipart"
+    try:
+        body = request.get_json(silent=True) or {}
+        b64 = body.get("data")
+        if b64:
+            import base64
+            return base64.b64decode(b64), "json"
+    except Exception:
+        pass
+    return None, None
+
+def _wait_until_ready(timeout_sec: float = 8.0) -> bool:
+    """detect 진입 시 최대 timeout_sec 동안 준비 대기"""
+    t0 = time.time()
+    while time.time() - t0 < timeout_sec:
+        if ready and model_err is None and model_kind == "torchscript":
+            return True
+        time.sleep(0.2)
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return jsonify(ok=True, health="/health"), 200
@@ -236,47 +293,35 @@ def health():
     code = 200 if status == "ready" else (500 if status == "error" else 503)
     return jsonify(info), code
 
-def _read_image_from_request() -> Tuple[Optional[bytes], Optional[str]]:
-    file = request.files.get("file") or request.files.get("image")
-    if file:
-        return file.read(), "multipart"
-    try:
-        body = request.get_json(silent=True) or {}
-        b64 = body.get("data")
-        if b64:
-            import base64
-            return base64.b64decode(b64), "json"
-    except Exception:
-        pass
-    return None, None
-
-def _wait_until_ready(timeout_sec: float = 8.0) -> bool:
-    """detect 진입 시 최장 timeout_sec 동안 준비 대기"""
-    t0 = time.time()
-    while time.time() - t0 < timeout_sec:
-        if ready and model_err is None and model_kind == "torchscript":
-            return True
-        time.sleep(0.2)
-    return False
-
 @app.post("/detect")
 def detect():
+    # 준비 대기
     if not (ready and model_err is None and model_kind == "torchscript"):
         if not _wait_until_ready(8.0):
-            # 아직도 준비 안됨 → 상태에 따라 명확히 반환
             if model_err:
+                app.logger.error(f"[detect] reject: model_err={model_err}")
                 return jsonify(error=model_err), 500
+            app.logger.warning("[detect] reject: still loading")
             return jsonify(error="loading"), 503
 
     img_bytes, kind = _read_image_from_request()
     if not img_bytes:
         return jsonify(error="no file"), 400
 
-    sync = ALLOW_SYNC and (request.args.get("sync") == "1" or request.headers.get("X-Detect-Sync") == "1")
-    if sync:
+    # sync 요청이어도 바쁘면 즉시 큐로 (502 회피)
+    want_sync = ALLOW_SYNC and (request.args.get("sync") == "1" or request.headers.get("X-Detect-Sync") == "1")
+    if want_sync:
+        if not _infer_lock.acquire(blocking=False):
+            job_id = str(uuid.uuid4())
+            _jobs[job_id] = {"status": "queued"}
+            _job_q.put((job_id, img_bytes, kind or "multipart"))
+            app.logger.info(f"[detect] busy->queue {job_id}")
+            return jsonify(jobId=job_id), 202
         try:
-            with _infer_lock:
-                out = run_inference(img_bytes)
+            t0 = time.time()
+            out = run_inference(img_bytes)
+            dt = int((time.time() - t0) * 1000)
+            app.logger.info(f"[detect] sync ok in {dt} ms, det={len(out.get('detections', []))}")
             return jsonify(out), 200
         except Exception as e:
             app.logger.exception("[detect] sync failed")
@@ -284,12 +329,14 @@ def detect():
         finally:
             try: del img_bytes
             except Exception: pass
+            _infer_lock.release()
             gc.collect()
 
-    # async
+    # async 경로
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "queued"}
     _job_q.put((job_id, img_bytes, kind or "multipart"))
+    app.logger.info(f"[detect] async queued {job_id}")
     return jsonify(jobId=job_id), 202
 
 @app.post("/detect-json")
@@ -309,5 +356,5 @@ def job_status(job_id: str):
 
 # 로컬 실행용
 if __name__ == "__main__":
-    # import 시 이미 _startup_once(sync=True) 됨
+    # import 시 이미 _startup_once(sync=True) 실행됨
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

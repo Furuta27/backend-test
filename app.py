@@ -38,7 +38,7 @@ _started_once = False
 def _read_labels():
     """labels.txt 파일을 읽어 클래스 이름을 구성"""
     global LABELS
-    p = os.path.join(os.getcwd(), "junk.txt")
+    p = os.path.join(os.getcwd(), "labels.txt")
     if os.path.exists(p):
         with open(p, "r", encoding="utf-8") as f:
             LABELS = [ln.strip() for ln in f if ln.strip()]

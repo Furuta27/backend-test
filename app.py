@@ -1,17 +1,17 @@
-import os, io, time, uuid, threading, queue, gc
+import os, io, time, uuid, threading, queue, gc, hashlib
 from typing import Tuple, Dict, Any, Optional
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── 글로벌 상태 ───────────────────────────────────────────────────────────────
+# ── 글로벌 상태 (감지 서버) ───────────────────────────────────────────────────
 model: Optional[tuple] = None       # ("torchscript" | "dummy", handle)
 model_err: Optional[str] = None
 ready = False
 
 LABELS = []
 INPUT_SIZE = int(os.getenv("INPUT_SIZE", "640"))   # 416/384로 낮추면 메모리/502 완화
-ALLOW_SYNC = False                                  # ★ 항상 비동기(202 + /jobs 폴링)
+ALLOW_SYNC = False                                  # 항상 비동기(202 + /jobs 폴링)
 
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_q: "queue.Queue[Tuple[str, bytes, str]]" = queue.Queue()
@@ -94,7 +94,7 @@ def load_model_bg():
         _read_labels()
 
         # TorchScript 경로만 허용
-        ts_path = os.getenv("MODEL_TS_PATH", "yolov5s4.torchscript.ptl")
+        ts_path = os.getenv("MODEL_TS_PATH", "yolov5s3.torchscript.ptl")
         if not os.path.exists(ts_path):
             model_err = f"torchscript model not found: {ts_path}"
             ready = False
@@ -166,7 +166,7 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
         except Exception:
             dets = _postprocess_dummy(rw, rh)["detections"]
 
-        # ★ Top-1만 남기기
+        # Top-1만 남기기
         dets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
         dets = dets[:1]
 
@@ -257,7 +257,6 @@ def detect():
     if not img_bytes:
         return jsonify(error="no file"), 400
 
-    # 비동기 잡 등록 (ALLOW_SYNC=False 유지)
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "queued"}
     _job_q.put((job_id, img_bytes, kind or "multipart"))
@@ -277,6 +276,105 @@ def job_status(job_id: str):
     if j["status"] == "error":
         return jsonify(error=j.get("error", "unknown")), 500
     return jsonify(status=j["status"]), 202
+
+# ── 공공데이터 포털 프록시 (인코딩/디코딩 자동 대처) ─────────────────────────
+# ENV:
+#   GOV_SERVICE_KEY_DEC : (권장) 디코딩된 일반 키
+#   GOV_SERVICE_KEY_ENC : (선택) 인코딩된 키
+#   GOV_BASE            : 기본 https://apis.data.go.kr
+#   GOV_CACHE_TTL_SEC   : 기본 300초
+
+import requests, urllib.parse as _url
+try:
+    import xmltodict  # pip install xmltodict
+except Exception:
+    xmltodict = None
+
+GOV_BASE = os.getenv("GOV_BASE", "https://apis.data.go.kr").rstrip("/")
+GOV_KEY_DEC = os.getenv("GOV_SERVICE_KEY_DEC", "")
+GOV_KEY_ENC = os.getenv("GOV_SERVICE_KEY_ENC", "")
+GOV_TTL  = int(os.getenv("GOV_CACHE_TTL_SEC", "300"))
+
+_gov_cache: Dict[str, Dict[str, Any]] = {}
+
+def _cache_get(k: str):
+    v = _gov_cache.get(k)
+    if not v: return None
+    if time.time() - v["ts"] > GOV_TTL:
+        try: del _gov_cache[k]
+        except Exception: pass
+        return None
+    return v["data"]
+
+def _cache_set(k: str, data: Any):
+    _gov_cache[k] = {"ts": time.time(), "data": data}
+
+def _safe_jsonify(data: Any):
+    try:
+        return jsonify(data), 200
+    except Exception:
+        return jsonify(raw=str(data)[:2000]), 200
+
+def _ok_json_or_xml(r: requests.Response):
+    ct = (r.headers.get("content-type") or "").lower()
+    if "application/json" in ct:
+        try: return True, r.json()
+        except Exception: return False, r.text
+    if "xml" in ct and xmltodict is not None:
+        try: return True, xmltodict.parse(r.text)
+        except Exception: return False, r.text
+    return True, {"status_code": r.status_code, "content": r.text[:5000]}
+
+def _looks_like_key_error(payload: Any) -> bool:
+    s = str(payload).lower()
+    return ("service key" in s and ("invalid" in s or "not" in s or "등록" in s or "인증" in s))
+
+def _call_gov(url: str, qs: Dict[str, Any]) -> Any:
+    # 우선순위: 쿼리에 이미 있으면 그대로 → 없으면 DEC → ENC
+    if "serviceKey" in qs:
+        candidates = [qs["serviceKey"]]
+    else:
+        dec = GOV_KEY_DEC.strip()
+        enc = (GOV_KEY_ENC.strip() or _url.quote_plus(dec)) if dec else GOV_KEY_ENC.strip()
+        candidates = [dec, enc]
+        candidates = [c for i, c in enumerate(candidates) if c and c not in candidates[:i]]
+
+    last_error = None
+    for key in candidates:
+        q = dict(qs)
+        q["serviceKey"] = key
+        try:
+            r = requests.get(url, params=q, timeout=15)
+            ok, payload = _ok_json_or_xml(r)
+            if r.status_code == 200 and ok and not _looks_like_key_error(payload):
+                return payload
+            last_error = payload
+        except requests.Timeout:
+            last_error = {"error": "upstream timeout"}
+        except Exception as e:
+            last_error = {"error": str(e)}
+    return {"error": "key_failed", "detail": last_error}
+
+@app.get("/govapi/<path:subpath>")
+def gov_proxy(subpath: str):
+    if not (GOV_KEY_DEC or GOV_KEY_ENC):
+        return jsonify(error="server not configured: GOV_SERVICE_KEY_DEC/ENC"), 500
+
+    qs = dict(request.args)
+    qs.setdefault("returnType", "json")
+    qs.setdefault("type", "json")
+
+    url = f"{GOV_BASE}/{subpath.lstrip('/')}"
+
+    key_raw = url + "?" + "&".join(sorted([f"{k}={qs[k]}" for k in qs]))
+    h = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()
+    cached = _cache_get(h)
+    if cached is not None:
+        return _safe_jsonify(cached)
+
+    data = _call_gov(url, qs)
+    _cache_set(h, data)
+    return _safe_jsonify(data)
 
 # ── 로컬 실행 ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

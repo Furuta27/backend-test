@@ -1,11 +1,11 @@
 # requirements.txt
-Flask
-flask-cors
-gunicorn
-
-Pillow
+flask
+pillow
+torch
+requests
+xmltodict
 numpy
-pandas
+
 
 torch --index-url https://download.pytorch.org/whl/cpu
 torchvision --index-url https://download.pytorch.org/whl/cpu

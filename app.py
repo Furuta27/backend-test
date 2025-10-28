@@ -1,27 +1,42 @@
-import os, io, time, uuid, threading, queue, gc, hashlib
-from typing import Tuple, Dict, Any, Optional
+import os, io, gc, json, uuid, time, threading, queue
+from typing import Dict, Any, Optional, Tuple, List
+
 from flask import Flask, request, jsonify
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask
+# ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# ── 글로벌 상태 (감지 서버) ───────────────────────────────────────────────────
-model: Optional[tuple] = None       # ("torchscript" | "dummy", handle)
+# ─────────────────────────────────────────────────────────────────────────────
+# Global State
+# ─────────────────────────────────────────────────────────────────────────────
+# 모델은 "yolov5s3.torchscript.ptl"만 사용 (환경변수로 경로 변경 가능)
+TS_MODEL_PATH = os.getenv("TS_MODEL_PATH", "yolov5s4.torchscript.ptl")
+INPUT_SIZE = int(os.getenv("INPUT_SIZE", "640"))   # YOLO 입력 크기 정사각
+CONF_THRES = float(os.getenv("CONF_THRES", "0.25"))  # confidence threshold
+ALLOW_SYNC = True
+
+model_kind: str = "none"
+model = None  # torchscript jit module
 model_err: Optional[str] = None
-ready = False
+ready: bool = False
 
-LABELS = []
-INPUT_SIZE = int(os.getenv("INPUT_SIZE", "640"))   # 416/384로 낮추면 메모리/502 완화
-ALLOW_SYNC = False                                  # 항상 비동기(202 + /jobs 폴링)
+LABELS: List[str] = []
 
+# 202 비동기 처리용
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_q: "queue.Queue[Tuple[str, bytes, str]]" = queue.Queue()
-_infer_lock = threading.Lock()         # 동시 추론 1개 제한(메모리 절약)
-_started_once = False                  # 시작 루틴 1회만 실행
+_infer_lock = threading.Lock()
+_started_once = False
 
-# ── 유틸 ──────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Utils
+# ─────────────────────────────────────────────────────────────────────────────
 def _read_labels():
+    """labels.txt 를 읽어 클래스 이름 리스트를 구성"""
     global LABELS
-    p = os.path.join(os.getcwd(), "labels.txt")
+    p = os.path.join(os.getcwd(), "junk.txt")
     if os.path.exists(p):
         with open(p, "r", encoding="utf-8") as f:
             LABELS = [ln.strip() for ln in f if ln.strip()]
@@ -36,174 +51,221 @@ def _to_numpy(img):
     import numpy as np
     return np.array(img)
 
-def _resize_keep_ar(img, target: int):
+def _letterbox_pil(im, new_size: int):
+    """
+    PIL.Image -> (letterboxed PIL.Image, scale, pad_x, pad_y, orig_w, orig_h)
+    좌우/상하 여백을 114,114,114(회색)로 채워 new_size x new_size 로 맞춤
+    """
     from PIL import Image
-    w, h = img.size
-    if max(w, h) == target:
-        return img, w, h
-    if w >= h:
-        new_w = target
-        new_h = int(round(h * (target / w)))
+    ow, oh = im.size
+    if ow == 0 or oh == 0:
+        raise ValueError("invalid image size")
+
+    scale = min(new_size / ow, new_size / oh)
+    nw, nh = int(round(ow * scale)), int(round(oh * scale))
+    im_resized = im.resize((nw, nh), Image.BILINEAR)
+
+    canvas = Image.new("RGB", (new_size, new_size), (114, 114, 114))
+    pad_x = (new_size - nw) // 2
+    pad_y = (new_size - nh) // 2
+    canvas.paste(im_resized, (pad_x, pad_y))
+    return canvas, scale, pad_x, pad_y, ow, oh
+
+def _unwrap_to_numpy(x):
+    """torch.Tensor | list | tuple → numpy.ndarray 로 통일"""
+    import numpy as np
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+    except Exception:
+        pass
+    if isinstance(x, (list, tuple)):
+        return _unwrap_to_numpy(x[0]) if x and hasattr(x[0], "__array__") is False else \
+               _unwrap_to_numpy(np.array(x))
+    try:
+        return x if hasattr(x, "shape") else _unwrap_to_numpy(np.array(x))
+    except Exception:
+        return None
+
+def _parse_yolo_output(arr, conf_thres: float) -> List[List[float]]:
+    """
+    YOLOv5s TorchScript 출력 해석:
+    - 기대 형식: (N, 6) or (1, N, 6) with [x1, y1, x2, y2, conf, cls]
+    - 필요 시 list/ndarray 다양한 경우 방어적으로 처리
+    반환: [[x1,y1,x2,y2,conf,cls], ...]
+    """
+    import numpy as np
+
+    if arr is None:
+        return []
+
+    a = arr
+    if isinstance(a, (list, tuple)):
+        try:
+            a = np.array(a)
+        except Exception:
+            return []
+
+    if a.ndim == 3 and a.shape[0] == 1:
+        a = a[0]  # (1, N, 6) → (N, 6)
+    if a.ndim == 2 and a.shape[1] >= 6:
+        pass
     else:
-        new_h = target
-        new_w = int(round(w * (target / h)))
-    return img.resize((new_w, new_h), Image.BILINEAR), new_w, new_h
+        # 일부 구현은 (N,) 의 object 배열에 박스 배열이 들어있을 수 있음
+        try:
+            flat = []
+            for row in a:
+                r = np.array(row).reshape(-1)
+                if r.shape[0] >= 6:
+                    flat.append(r[:6])
+            a = np.array(flat)
+        except Exception:
+            return []
 
-def _postprocess_dummy(w: int, h: int) -> Dict[str, Any]:
-    # 디버그용 더미 박스 1개 (이미 Top-1 형태)
-    cx, cy = w // 3, h // 3
-    bw, bh = max(40, w // 4), max(40, h // 4)
-    return {
-        "class_names": LABELS or ["object"],
-        "detections": [{
-            "classIndex": 0,
-            "className": (LABELS[0] if LABELS else "object"),
-            "x": max(0, cx - bw//2),
-            "y": max(0, cy - bh//2),
-            "w": bw, "h": bh, "score": 0.80
-        }],
-        "time_ms": 1
-    }
+    if a.size == 0:
+        return []
 
-# ── 모델 로드 / 추론 ─────────────────────────────────────────────────────────
+    # conf 필터링
+    out = []
+    for r in a:
+        x1, y1, x2, y2, conf, cls = float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])
+        if conf >= conf_thres:
+            out.append([x1, y1, x2, y2, conf, cls])
+    return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Loading / Inference
+# ─────────────────────────────────────────────────────────────────────────────
 def load_model_bg():
-    """오직 yolov5s3.torchscript.ptl (또는 MODEL_TS_PATH)만 로드. .pt/ultralytics는 사용하지 않음."""
-    global model, model_err, ready
-
+    """백그라운드에서 TorchScript 모델만 로드. 실패 시 ready=False + model_err 설정."""
+    global model, model_kind, model_err, ready
     model = None
+    model_kind = "none"
     model_err = None
     ready = False
 
     try:
-        # 스레드/옵션 최소화(메모리 절약)
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         try:
             import torch
             torch.set_num_threads(1)
-            torch.set_num_interop_threads(1)
-            torch.set_grad_enabled(False)  # type: ignore[attr-defined]
-            try:
-                import torch.backends.mkldnn as mkldnn  # type: ignore
-                mkldnn.enabled = False  # type: ignore[attr-defined]
-            except Exception:
-                pass
         except Exception:
             pass
 
         _read_labels()
 
-        # TorchScript 경로만 허용
-        ts_path = os.getenv("MODEL_TS_PATH", "yolov5s3.torchscript.ptl")
-        if not os.path.exists(ts_path):
-            model_err = f"torchscript model not found: {ts_path}"
-            ready = False
-            app.logger.error(f"[startup] {model_err}")
+        if not os.path.exists(TS_MODEL_PATH):
+            model_err = f"torchscript model not found: {TS_MODEL_PATH}"
+            app.logger.error("[startup] " + model_err)
             return
 
-        # TorchScript 로드 (CPU)
         import torch
-        m = torch.jit.load(ts_path, map_location="cpu")
+        m = torch.jit.load(TS_MODEL_PATH, map_location="cpu")
         m.eval()
-        model = ("torchscript", m)
+        # 더 일찍 터지도록 더미 추론 1회
+        dummy = torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE)
+        with torch.no_grad():
+            _ = m(dummy)
+
+        model = m
+        model_kind = "torchscript"
         ready = True
         model_err = None
-        app.logger.info(f"[startup] torchscript model loaded: {ts_path}")
+        app.logger.info(f"[startup] torchscript loaded: {TS_MODEL_PATH}")
 
     except Exception as e:
         model = None
-        ready = False
+        model_kind = "none"
         model_err = str(e)
-        app.logger.exception("[startup] torchscript load failed")
+        ready = False
+        app.logger.exception("[startup] model load failed")
 
 def run_inference(img_bytes: bytes) -> Dict[str, Any]:
+    """단일 이미지 바이트에 대한 추론. 결과 박스는 원본 이미지 좌표계로 반환."""
     t0 = time.time()
-    global model, LABELS
+    if not ready or model is None or model_kind != "torchscript":
+        raise RuntimeError("model not ready")
+
+    from PIL import Image
+    import torch, numpy as np
+
+    # 원본 로드
     pil = _pil_open(img_bytes)
-    pil_resized, rw, rh = _resize_keep_ar(pil, INPUT_SIZE)
-    kind = model[0] if model else "none"
+    # letterbox
+    canvas, scale, pad_x, pad_y, ow, oh = _letterbox_pil(pil, INPUT_SIZE)
 
-    if kind in ("none", "dummy"):
-        res = _postprocess_dummy(rw, rh)
-        res["__serverImageW"] = rw; res["__serverImageH"] = rh
-        res["time_ms"] = int((time.time() - t0) * 1000)
-        return res
+    # 텐서화
+    np_img = _to_numpy(canvas)  # HWC RGB [0..255]
+    inp = torch.from_numpy(np_img).permute(2, 0, 1).unsqueeze(0).float() / 255.0
 
-    if kind == "torchscript":
-        import torch
-        m = model[1]
-        np_img = _to_numpy(pil_resized)           # HWC RGB
-        inp = torch.from_numpy(np_img).permute(2,0,1).unsqueeze(0).float() / 255.0
-        with torch.no_grad():
-            out = m(inp)
+    with torch.no_grad():
+        out = model(inp)
+    arr = _unwrap_to_numpy(out)  # 다양한 타입 → ndarray
 
-        # 다양한 TorchScript export 포맷 대응 → numpy/리스트로 정규화
-        if isinstance(out, (list, tuple)):
-            out = out[0]
-        if isinstance(out, torch.Tensor):
-            out = out.cpu().numpy()
-        try:
-            arr = out
-            if hasattr(arr, "shape") and len(arr.shape) == 3:
-                arr = arr[0]              # (1,N,6) → (N,6)
-        except Exception:
-            arr = out
+    # YOLO 출력 파싱 (letterbox 좌표)
+    det_raw = _parse_yolo_output(arr, CONF_THRES)
 
-        dets = []
-        try:
-            for row in arr:
-                if len(row) < 6:
-                    continue
-                x1,y1,x2,y2,conf,cls = row[:6]
-                x1,y1,x2,y2 = int(round(float(x1))), int(round(float(y1))), int(round(float(x2))), int(round(float(y2)))
-                w = max(0, x2-x1); h = max(0, y2-y1)
-                dets.append({
-                    "classIndex": int(cls),
-                    "className": (LABELS[int(cls)] if 0 <= int(cls) < len(LABELS) else None),
-                    "x": max(0, x1), "y": max(0, y1),
-                    "w": w, "h": h, "score": float(conf)
-                })
-        except Exception:
-            dets = _postprocess_dummy(rw, rh)["detections"]
+    # letterbox → 원본 좌표로 복원
+    dets: List[Dict[str, Any]] = []
+    for x1, y1, x2, y2, conf, cls in det_raw:
+        # 원본계로 역변환
+        ox1 = max(0.0, min(ow, (x1 - pad_x) / scale))
+        oy1 = max(0.0, min(oh, (y1 - pad_y) / scale))
+        ox2 = max(0.0, min(ow, (x2 - pad_x) / scale))
+        oy2 = max(0.0, min(oh, (y2 - pad_y) / scale))
 
-        # Top-1만 남기기
-        dets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
-        dets = dets[:1]
+        w = max(0.0, ox2 - ox1)
+        h = max(0.0, oy2 - oy1)
+        cls_i = int(round(cls))
+        cls_name = LABELS[cls_i] if 0 <= cls_i < len(LABELS) else None
 
-        return {
-            "class_names": LABELS,
-            "detections": dets,
-            "time_ms": int((time.time() - t0) * 1000),
-            "__serverImageW": rw, "__serverImageH": rh,
-        }
+        dets.append({
+            "classIndex": cls_i,
+            "className": cls_name,
+            "x": int(round(ox1)),
+            "y": int(round(oy1)),
+            "w": int(round(w)),
+            "h": int(round(h)),
+            "score": float(conf),
+        })
 
-    # 이외는 더미
-    res = _postprocess_dummy(rw, rh)
-    res["__serverImageW"] = rw; res["__serverImageH"] = rh
-    res["time_ms"] = int((time.time() - t0) * 1000)
-    return res
+    return {
+        "class_names": LABELS,
+        "detections": dets,
+        "time_ms": int((time.time() - t0) * 1000),
+        "__serverImageW": ow, "__serverImageH": oh,
+        "__input_size": INPUT_SIZE,
+        "__model": model_kind,
+    }
 
-# ── 워커(202 잡 처리) ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker (202 async)
+# ─────────────────────────────────────────────────────────────────────────────
 def _start_worker_once():
     def _worker():
         app.logger.info("[worker] started")
         while True:
             try:
-                job_id, img_bytes, kind = _job_q.get()
+                job_id, img_bytes, req_kind = _job_q.get()
                 _jobs[job_id] = {"status": "running"}
                 with _infer_lock:
                     out = run_inference(img_bytes)
                 _jobs[job_id] = {"status": "done", "result": out}
-                del img_bytes; gc.collect()
             except Exception as e:
                 _jobs[job_id] = {"status": "error", "error": str(e)}
             finally:
+                try:
+                    del img_bytes
+                except Exception:
+                    pass
+                gc.collect()
                 _job_q.task_done()
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
 
 def _startup_once():
-    """Flask 훅 의존 없이 시작 루틴을 1회만 실행."""
     global _started_once
     if _started_once:
         return
@@ -212,27 +274,36 @@ def _startup_once():
     _start_worker_once()
     app.logger.info("[startup] background threads started")
 
-# ── 훅: 모든 요청 전에 한 번만 시작 ──────────────────────────────────────────
+# 모든 요청 전에 1회 스타트 보장
 @app.before_request
 def _ensure_started():
     _startup_once()
     request.start_ts = time.time()
 
-# ── 헬스/루트 ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return jsonify(ok=True, health="/health"), 200
 
 @app.get("/health")
 def health():
-    if ready and model_err is None:
-        return jsonify(status="ready"), 200
-    if model_err is not None:
-        return jsonify(status="error", error=model_err), 500
-    return jsonify(status="warming"), 503  # 준비 중엔 503
+    status = "ready" if ready and model_err is None else ("error" if model_err else "warming")
+    info = {
+        "status": status,
+        "model": model_kind,
+        "model_file": TS_MODEL_PATH if model_kind == "torchscript" else None,
+        "labels_count": len(LABELS),
+        "input_size": INPUT_SIZE,
+        "conf_thres": CONF_THRES,
+        "error": model_err,
+    }
+    code = 200 if status == "ready" else (500 if status == "error" else 503)
+    return jsonify(info), code
 
-# ── 입력 파싱 ────────────────────────────────────────────────────────────────
 def _read_image_from_request() -> Tuple[Optional[bytes], Optional[str]]:
+    """multipart(file|image) 또는 JSON({data: base64}) 지원"""
     file = request.files.get("file") or request.files.get("image")
     if file:
         return file.read(), "multipart"
@@ -246,17 +317,36 @@ def _read_image_from_request() -> Tuple[Optional[bytes], Optional[str]]:
         pass
     return None, None
 
-# ── 감지 API (항상 비동기 큐) ────────────────────────────────────────────────
 @app.post("/detect")
 def detect():
-    if not ready or model is None:
-        code = 500 if model_err else 503
-        return jsonify(error="loading" if code == 503 else model_err), code
+    if not ready or model is None or model_kind != "torchscript":
+        # 로딩 실패/진행중이면 명확히 503/500로 알림
+        if model_err:
+            return jsonify(error=model_err), 500
+        return jsonify(error="loading"), 503
 
     img_bytes, kind = _read_image_from_request()
     if not img_bytes:
         return jsonify(error="no file"), 400
 
+    sync = ALLOW_SYNC and (request.args.get("sync") == "1" or request.headers.get("X-Detect-Sync") == "1")
+
+    if sync:
+        try:
+            with _infer_lock:
+                out = run_inference(img_bytes)
+            return jsonify(out), 200
+        except Exception as e:
+            app.logger.exception("[detect] sync failed")
+            return jsonify(error=str(e)), 500
+        finally:
+            try:
+                del img_bytes
+            except Exception:
+                pass
+            gc.collect()
+
+    # async 202
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "queued"}
     _job_q.put((job_id, img_bytes, kind or "multipart"))
@@ -277,106 +367,9 @@ def job_status(job_id: str):
         return jsonify(error=j.get("error", "unknown")), 500
     return jsonify(status=j["status"]), 202
 
-# ── 공공데이터 포털 프록시 (인코딩/디코딩 자동 대처) ─────────────────────────
-# ENV:
-#   GOV_SERVICE_KEY_DEC : (권장) 디코딩된 일반 키
-#   GOV_SERVICE_KEY_ENC : (선택) 인코딩된 키
-#   GOV_BASE            : 기본 https://apis.data.go.kr
-#   GOV_CACHE_TTL_SEC   : 기본 300초
-
-import requests, urllib.parse as _url
-try:
-    import xmltodict  # pip install xmltodict
-except Exception:
-    xmltodict = None
-
-GOV_BASE = os.getenv("GOV_BASE", "https://apis.data.go.kr").rstrip("/")
-GOV_KEY_DEC = os.getenv("GOV_SERVICE_KEY_DEC", "")
-GOV_KEY_ENC = os.getenv("GOV_SERVICE_KEY_ENC", "")
-GOV_TTL  = int(os.getenv("GOV_CACHE_TTL_SEC", "300"))
-
-_gov_cache: Dict[str, Dict[str, Any]] = {}
-
-def _cache_get(k: str):
-    v = _gov_cache.get(k)
-    if not v: return None
-    if time.time() - v["ts"] > GOV_TTL:
-        try: del _gov_cache[k]
-        except Exception: pass
-        return None
-    return v["data"]
-
-def _cache_set(k: str, data: Any):
-    _gov_cache[k] = {"ts": time.time(), "data": data}
-
-def _safe_jsonify(data: Any):
-    try:
-        return jsonify(data), 200
-    except Exception:
-        return jsonify(raw=str(data)[:2000]), 200
-
-def _ok_json_or_xml(r: requests.Response):
-    ct = (r.headers.get("content-type") or "").lower()
-    if "application/json" in ct:
-        try: return True, r.json()
-        except Exception: return False, r.text
-    if "xml" in ct and xmltodict is not None:
-        try: return True, xmltodict.parse(r.text)
-        except Exception: return False, r.text
-    return True, {"status_code": r.status_code, "content": r.text[:5000]}
-
-def _looks_like_key_error(payload: Any) -> bool:
-    s = str(payload).lower()
-    return ("service key" in s and ("invalid" in s or "not" in s or "등록" in s or "인증" in s))
-
-def _call_gov(url: str, qs: Dict[str, Any]) -> Any:
-    # 우선순위: 쿼리에 이미 있으면 그대로 → 없으면 DEC → ENC
-    if "serviceKey" in qs:
-        candidates = [qs["serviceKey"]]
-    else:
-        dec = GOV_KEY_DEC.strip()
-        enc = (GOV_KEY_ENC.strip() or _url.quote_plus(dec)) if dec else GOV_KEY_ENC.strip()
-        candidates = [dec, enc]
-        candidates = [c for i, c in enumerate(candidates) if c and c not in candidates[:i]]
-
-    last_error = None
-    for key in candidates:
-        q = dict(qs)
-        q["serviceKey"] = key
-        try:
-            r = requests.get(url, params=q, timeout=15)
-            ok, payload = _ok_json_or_xml(r)
-            if r.status_code == 200 and ok and not _looks_like_key_error(payload):
-                return payload
-            last_error = payload
-        except requests.Timeout:
-            last_error = {"error": "upstream timeout"}
-        except Exception as e:
-            last_error = {"error": str(e)}
-    return {"error": "key_failed", "detail": last_error}
-
-@app.get("/govapi/<path:subpath>")
-def gov_proxy(subpath: str):
-    if not (GOV_KEY_DEC or GOV_KEY_ENC):
-        return jsonify(error="server not configured: GOV_SERVICE_KEY_DEC/ENC"), 500
-
-    qs = dict(request.args)
-    qs.setdefault("returnType", "json")
-    qs.setdefault("type", "json")
-
-    url = f"{GOV_BASE}/{subpath.lstrip('/')}"
-
-    key_raw = url + "?" + "&".join(sorted([f"{k}={qs[k]}" for k in qs]))
-    h = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()
-    cached = _cache_get(h)
-    if cached is not None:
-        return _safe_jsonify(cached)
-
-    data = _call_gov(url, qs)
-    _cache_set(h, data)
-    return _safe_jsonify(data)
-
-# ── 로컬 실행 ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Local run
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     _startup_once()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

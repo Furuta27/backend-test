@@ -1,13 +1,14 @@
-import os, io, gc, json, uuid, time, threading, queue
+import os, io, gc, uuid, time, threading, queue
 from typing import Dict, Any, Optional, Tuple, List
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ── Config ───────────────────────────────────────────────────────────────────
-TS_MODEL_PATH = os.getenv("TS_MODEL_PATH", "yolov5s4.torchscript.ptl")  # 반드시 존재
+TS_MODEL_PATH = os.getenv("TS_MODEL_PATH", "yolov5s4.torchscript.ptl")
 INPUT_SIZE    = int(os.getenv("INPUT_SIZE", "640"))
 CONF_THRES    = float(os.getenv("CONF_THRES", "0.25"))
+HIST_KEEP     = int(os.getenv("HIST_KEEP", "20"))   # 평균 추론시간 계산용 저장 개수
 
 # ── Global state ─────────────────────────────────────────────────────────────
 model_kind: str = "none"   # "torchscript" | "none"
@@ -16,11 +17,13 @@ model_err: Optional[str] = None
 ready: bool = False
 LABELS: List[str] = []
 
-# 202 async
 _jobs: Dict[str, Dict[str, Any]] = {}
-_job_q: "queue.Queue[Tuple[str, bytes, str]]" = queue.Queue()
+_job_q: "queue.Queue[Tuple[str, bytes, str, float]]" = queue.Queue()
 _infer_lock = threading.Lock()
 _started_once = False
+
+_last_durations_ms: List[int] = []       # 최근 추론 시간
+_avg_ms: int = 0
 
 # ── Utils ────────────────────────────────────────────────────────────────────
 def _read_labels():
@@ -98,6 +101,13 @@ def _parse_yolo_output(arr, conf_thres: float) -> List[List[float]]:
             out.append([x1,y1,x2,y2,conf,cls])
     return out
 
+def _update_hist(ms: int):
+    global _avg_ms
+    _last_durations_ms.append(ms)
+    if len(_last_durations_ms) > HIST_KEEP:
+        del _last_durations_ms[0:len(_last_durations_ms)-HIST_KEEP]
+    _avg_ms = int(sum(_last_durations_ms) / max(1, len(_last_durations_ms)))
+
 # ── Model load / inference ───────────────────────────────────────────────────
 def load_model_sync():
     global model, model_kind, model_err, ready
@@ -157,10 +167,12 @@ def run_inference(img_bytes: bytes) -> Dict[str, Any]:
             "w": int(round(w)), "h": int(round(h)),
             "score": float(conf),
         })
+    ms = int((time.time()-t0)*1000)
+    _update_hist(ms)
     return {
         "class_names": LABELS,
         "detections": dets,
-        "time_ms": int((time.time()-t0)*1000),
+        "time_ms": ms,
         "__serverImageW": ow, "__serverImageH": oh,
         "__input_size": INPUT_SIZE, "__model": model_kind,
     }
@@ -171,13 +183,17 @@ def _start_worker_once():
         app.logger.info("[worker] started")
         while True:
             try:
-                job_id, img_bytes, kind = _job_q.get()
-                _jobs[job_id] = {"status": "running"}
+                job_id, img_bytes, kind, queued_at = _job_q.get()
+                _jobs[job_id].update({"status": "running", "started_at": time.time()})
                 with _infer_lock:
                     out = run_inference(img_bytes)
-                _jobs[job_id] = {"status": "done", "result": out}
+                _jobs[job_id].update({
+                    "status": "done",
+                    "result": out,
+                    "finished_at": time.time()
+                })
             except Exception as e:
-                _jobs[job_id] = {"status": "error", "error": str(e)}
+                _jobs[job_id].update({"status": "error", "error": str(e), "finished_at": time.time()})
             finally:
                 try: del img_bytes
                 except Exception: pass
@@ -189,7 +205,7 @@ def _startup_once():
     global _started_once
     if _started_once: return
     _started_once = True
-    load_model_sync()          # 동기 로드: import 시 바로 올림
+    load_model_sync()          # 동기 로드
     _start_worker_once()
     app.logger.info("[startup] background threads started")
 
@@ -210,6 +226,19 @@ def _read_image_from_request() -> Tuple[Optional[bytes], Optional[str]]:
         pass
     return None, None
 
+def _queue_position(job_id: str) -> int:
+    # queued_at 기준으로 정렬하여 현재 job의 앞선 queued 수 + running 0/1 반영
+    if job_id not in _jobs: return -1
+    me = _jobs[job_id]
+    if me["status"] != "queued":
+        return 0
+    my_t = me.get("queued_at", 0.0)
+    # 자신보다 먼저 큐잉된 'queued' 건수
+    ahead = sum(1 for j in _jobs.values() if j.get("status") == "queued" and j.get("queued_at", 1e15) < my_t)
+    # 현재 실행 중이 있으면 +1 (자신 앞에서 하나 처리 중)
+    running = any(j.get("status") == "running" for j in _jobs.values())
+    return ahead + (1 if running else 0)
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -223,16 +252,15 @@ def health():
         "model_file": TS_MODEL_PATH if model_kind == "torchscript" else None,
         "labels_count": len(LABELS), "input_size": INPUT_SIZE,
         "conf_thres": CONF_THRES, "error": model_err,
+        "avg_time_ms": _avg_ms,
     }
     code = 200 if status == "ready" else (500 if status == "error" else 503)
     return jsonify(info), code
 
 @app.post("/detect")
 def detect():
-    # 항상 202 비동기: sync 경로 제거 → 502 윈도우 최소화
+    # 항상 202 비동기
     if not (ready and model_err is None and model_kind == "torchscript"):
-        # 준비 안 된 경우에도 503 대신 짧게 큐잉 후 처리하도록 202로 돌려도 되지만,
-        # 명확성을 위해 에러 반환
         code = 500 if model_err else 503
         return jsonify(error=model_err or "loading"), code
 
@@ -241,21 +269,42 @@ def detect():
         return jsonify(error="no file"), 400
 
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"status": "queued"}
-    _job_q.put((job_id, img_bytes, kind or "multipart"))
-    app.logger.info(f"[detect] queued {job_id}")
-    return jsonify(jobId=job_id), 202
+    now = time.time()
+    _jobs[job_id] = {
+        "status": "queued",
+        "queued_at": now,
+    }
+    _job_q.put((job_id, img_bytes, kind or "multipart", now))
+
+    pos = _queue_position(job_id)
+    # 평균 추론 시간으로 대략적 ETA 추정
+    eta_ms = max(0, pos) * max(1, _avg_ms or 3000)
+
+    app.logger.info(f"[detect] queued {job_id} pos={pos} eta≈{eta_ms}ms")
+    return jsonify(jobId=job_id, status="queued", position=pos, eta_ms=eta_ms), 202
 
 @app.get("/jobs/<job_id>")
 def job_status(job_id: str):
     j = _jobs.get(job_id)
     if not j:
         return jsonify(error="not found"), 404
-    if j["status"] == "done":
+    s = j["status"]
+    if s == "done":
         return jsonify(j["result"]), 200
-    if j["status"] == "error":
+    if s == "error":
         return jsonify(error=j.get("error","unknown")), 500
-    return jsonify(status=j["status"]), 202
+    # queued or running
+    now = time.time()
+    if s == "queued":
+        pos = _queue_position(job_id)
+        waited = int((now - j.get("queued_at", now)) * 1000)
+        eta_ms = max(0, pos) * max(1, _avg_ms or 3000)
+        return jsonify(status="queued", position=pos, waited_ms=waited, eta_ms=eta_ms), 202
+    if s == "running":
+        started = j.get("started_at", now)
+        running_for = int((now - started) * 1000)
+        return jsonify(status="running", running_ms=running_for, avg_time_ms=_avg_ms), 202
+    return jsonify(status=s), 202
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
